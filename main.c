@@ -2,15 +2,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <ctype.h>  // pour tolower()
-#include "bitmap.h"
+#include <ctype.h>
 
 #define MAX_FILES 128
 #define BLOCK_SIZE 512
-#define DISK_SIZE (BLOCK_SIZE * 1024) // 512 KB
+#define TOTAL_BLOCKS 1024
+#define DISK_SIZE (BLOCK_SIZE * TOTAL_BLOCKS)
 #define MAX_FILE_SIZE (BLOCK_SIZE * 10)
-
-char username[32] = "user";
+#define FAT_FREE -2
+#define FAT_EOF -1
 
 typedef enum { READ = 1, WRITE = 2, EXECUTE = 4 } Permission;
 
@@ -24,8 +24,8 @@ struct File {
     time_t modified;
     int permissions;
     int is_directory;
-    size_t start_block;
-    Directory *dir; // if it's a directory
+    int start_block; // Premier bloc dans FAT
+    Directory *dir;
     File *parent;
 };
 
@@ -37,13 +37,15 @@ struct Directory {
 typedef struct {
     Directory root;
     Directory *current_dir;
-    Bitmap *bitmap;
+    int *FAT;
     char *disk;
 } FileSystem;
 
 FileSystem fs;
 File *current_dir_file = NULL;
+char username[32] = "user";
 
+// ========================== UTILITAIRES ==========================
 void print_help() {
     printf("Available commands:\n");
     printf("  help            - Show this help message\n");
@@ -59,10 +61,26 @@ void print_help() {
 
 void fs_init() {
     fs.disk = calloc(1, DISK_SIZE);
-    fs.bitmap = bitmap_create(DISK_SIZE / BLOCK_SIZE);
+    fs.FAT = malloc(sizeof(int) * TOTAL_BLOCKS);
+    for (int i = 0; i < TOTAL_BLOCKS; i++) fs.FAT[i] = FAT_FREE;
     fs.root.file_count = 0;
     fs.current_dir = &fs.root;
     current_dir_file = NULL;
+}
+
+int allocate_block() {
+    for (int i = 0; i < TOTAL_BLOCKS; i++) {
+        if (fs.FAT[i] == FAT_FREE) return i;
+    }
+    return -1;
+}
+
+void free_chain(int block) {
+    while (block != FAT_EOF && block != FAT_FREE) {
+        int next = fs.FAT[block];
+        fs.FAT[block] = FAT_FREE;
+        block = next;
+    }
 }
 
 void get_current_path(char *buffer, size_t size, Directory *dir, const char *current_name) {
@@ -89,51 +107,6 @@ void print_prompt() {
     printf("\033[32m%s@fs\033[0m:\033[34m%s\033[0m$ ", username, path);
 }
 
-int find_free_block() {
-    for (size_t i = 0; i < fs.bitmap->size_in_bits; i++) {
-        if (!bitmap_get(fs.bitmap, i)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-void fs_create_file(const char *name, int is_dir) {
-    if (fs.current_dir->file_count >= MAX_FILES) {
-        printf("Error: directory full\n");
-        return;
-    }
-    for (size_t i = 0; i < fs.current_dir->file_count; i++) {
-        if (strcmp(fs.current_dir->files[i].name, name) == 0) {
-            printf("Error: file or directory already exists\n");
-            return;
-        }
-    }
-    File *file = &fs.current_dir->files[fs.current_dir->file_count++];
-    strncpy(file->name, name, sizeof(file->name));
-    file->size = 0;
-    file->created = time(NULL);
-    file->modified = time(NULL);
-    file->permissions = READ | WRITE | EXECUTE;
-    file->is_directory = is_dir;
-    file->parent = current_dir_file;
-    if (is_dir) {
-        file->dir = malloc(sizeof(Directory));
-        file->dir->file_count = 0;
-        file->start_block = 0;
-    } else {
-        int block = find_free_block();
-        if (block == -1) {
-            printf("Error: no free space\n");
-            fs.current_dir->file_count--;
-            return;
-        }
-        bitmap_set(fs.bitmap, block);
-        file->start_block = block;
-        file->dir = NULL;
-    }
-}
-
 File *fs_find_file(Directory *dir, const char *name) {
     for (size_t i = 0; i < dir->file_count; i++) {
         if (strcmp(dir->files[i].name, name) == 0) {
@@ -143,15 +116,42 @@ File *fs_find_file(Directory *dir, const char *name) {
     return NULL;
 }
 
-int confirm_deletion(const char *name) {
-    printf("Le dossier '%s' n'est pas vide. Voulez-vous vraiment le supprimer ? (y/n) : ", name);
-    char answer[8];
-    if (fgets(answer, sizeof(answer), stdin)) {
-        if (tolower(answer[0]) == 'y') {
-            return 1;
-        }
+// ========================== FONCTIONS FS ==========================
+void fs_create_file(const char *name, int is_dir) {
+    if (!name) return;
+    if (fs.current_dir->file_count >= MAX_FILES) {
+        printf("Error: directory full\n");
+        return;
     }
-    return 0;
+    if (fs_find_file(fs.current_dir, name)) {
+        printf("Error: file or directory already exists\n");
+        return;
+    }
+
+    File *file = &fs.current_dir->files[fs.current_dir->file_count++];
+    strncpy(file->name, name, sizeof(file->name));
+    file->size = 0;
+    file->created = time(NULL);
+    file->modified = time(NULL);
+    file->permissions = READ | WRITE;
+    file->is_directory = is_dir;
+    file->parent = current_dir_file;
+
+    if (is_dir) {
+        file->dir = malloc(sizeof(Directory));
+        file->dir->file_count = 0;
+        file->start_block = -1;
+    } else {
+        int blk = allocate_block();
+        if (blk == -1) {
+            printf("Error: no free space\n");
+            fs.current_dir->file_count--;
+            return;
+        }
+        fs.FAT[blk] = FAT_EOF;
+        file->start_block = blk;
+        file->dir = NULL;
+    }
 }
 
 void fs_delete_file_recursive(File *file) {
@@ -161,7 +161,7 @@ void fs_delete_file_recursive(File *file) {
         }
         free(file->dir);
     } else {
-        bitmap_clear(fs.bitmap, file->start_block);
+        free_chain(file->start_block);
     }
 }
 
@@ -170,15 +170,13 @@ void fs_delete_file(const char *name) {
         File *file = &fs.current_dir->files[i];
         if (strcmp(file->name, name) == 0) {
             if (file->is_directory && file->dir->file_count > 0) {
-                if (!confirm_deletion(name)) {
-                    printf("Suppression annulée.\n");
-                    return;
-                }
+                printf("Directory not empty. Delete? (y/n): ");
+                char ans[8]; fgets(ans, sizeof(ans), stdin);
+                if (tolower(ans[0]) != 'y') return;
             }
             fs_delete_file_recursive(file);
-            for (size_t j = i; j < fs.current_dir->file_count - 1; j++) {
+            for (size_t j = i; j < fs.current_dir->file_count - 1; j++)
                 fs.current_dir->files[j] = fs.current_dir->files[j + 1];
-            }
             fs.current_dir->file_count--;
             return;
         }
@@ -189,23 +187,58 @@ void fs_delete_file(const char *name) {
 void fs_write_file(const char *name, const char *content) {
     File *file = fs_find_file(fs.current_dir, name);
     if (!file || file->is_directory) {
-        printf("Error: file not found or is directory\n");
+        printf("Error: invalid file\n");
         return;
     }
+
+    free_chain(file->start_block);
+    file->start_block = -1;
+
     size_t len = strlen(content);
     if (len > MAX_FILE_SIZE) len = MAX_FILE_SIZE;
-    memcpy(fs.disk + file->start_block * BLOCK_SIZE, content, len);
     file->size = len;
+
+    int prev_block = -1;
+    size_t written = 0;
+
+    while (written < len) {
+        int blk = allocate_block();
+        if (blk == -1) {
+            printf("Disk full\n");
+            return;
+        }
+        size_t chunk = (len - written > BLOCK_SIZE) ? BLOCK_SIZE : (len - written);
+        memcpy(fs.disk + blk * BLOCK_SIZE, content + written, chunk);
+
+        if (prev_block != -1)
+            fs.FAT[prev_block] = blk;
+        else
+            file->start_block = blk;
+
+        fs.FAT[blk] = FAT_EOF;
+        prev_block = blk;
+        written += chunk;
+    }
+
     file->modified = time(NULL);
 }
 
 void fs_read_file(const char *name) {
     File *file = fs_find_file(fs.current_dir, name);
     if (!file || file->is_directory) {
-        printf("Error: file not found or is directory\n");
+        printf("Error: invalid file\n");
         return;
     }
-    fwrite(fs.disk + file->start_block * BLOCK_SIZE, 1, file->size, stdout);
+
+    int blk = file->start_block;
+    size_t left = file->size;
+
+    while (blk != FAT_EOF && left > 0) {
+        size_t chunk = left > BLOCK_SIZE ? BLOCK_SIZE : left;
+        fwrite(fs.disk + blk * BLOCK_SIZE, 1, chunk, stdout);
+        left -= chunk;
+        blk = fs.FAT[blk];
+    }
     printf("\n");
 }
 
@@ -218,31 +251,24 @@ int compare_files(const void *a, const void *b) {
 void fs_list() {
     if (fs.current_dir->file_count == 0) return;
 
-    // On fait une copie du tableau pour ne pas modifier l'ordre dans le répertoire
-    File sorted_files[MAX_FILES];
-    memcpy(sorted_files, fs.current_dir->files, sizeof(File) * fs.current_dir->file_count);
-
-    qsort(sorted_files, fs.current_dir->file_count, sizeof(File), compare_files);
-
-    printf("total %d\n", fs.current_dir->file_count);
+    File sorted[MAX_FILES];
+    memcpy(sorted, fs.current_dir->files, sizeof(File) * fs.current_dir->file_count);
+    qsort(sorted, fs.current_dir->file_count, sizeof(File), compare_files);
 
     for (size_t i = 0; i < fs.current_dir->file_count; i++) {
-        File *f = &sorted_files[i];
-
+        File *f = &sorted[i];
         char perm[4] = "---";
         if (f->permissions & READ) perm[0] = 'r';
         if (f->permissions & WRITE) perm[1] = 'w';
         if (f->permissions & EXECUTE) perm[2] = 'x';
 
-        printf("%c%s\t%lu bytes\t\033[34m%s\033[0m\n",
-               f->is_directory ? 'd' : '-',
-               perm,
-               f->size,
-               f->name);
+        printf("%c%s\t%lu bytes\t%s\n",
+               f->is_directory ? 'd' : '-', perm, f->size, f->name);
     }
 }
 
 void fs_change_dir(const char *name) {
+    if (!name) return;
     if (strcmp(name, "..") == 0) {
         if (current_dir_file && current_dir_file->parent) {
             fs.current_dir = current_dir_file->parent->dir;
@@ -262,25 +288,29 @@ void fs_change_dir(const char *name) {
     current_dir_file = f;
 }
 
+// ========================== MAIN LOOP ==========================
 int main() {
     fs_init();
+
     printf("Enter your username: ");
     fgets(username, sizeof(username), stdin);
     username[strcspn(username, "\n")] = 0;
     if (strlen(username) == 0) strcpy(username, "user");
 
     print_help();
-
     char line[256];
+
     while (1) {
         print_prompt();
         if (!fgets(line, sizeof(line), stdin)) break;
         char *cmd = strtok(line, " \n");
         if (!cmd) continue;
+
         if (strcmp(cmd, "exit") == 0) break;
         else if (strcmp(cmd, "touch") == 0) fs_create_file(strtok(NULL, " \n"), 0);
         else if (strcmp(cmd, "mkdir") == 0) fs_create_file(strtok(NULL, " \n"), 1);
         else if (strcmp(cmd, "ls") == 0) fs_list();
+        else if (strcmp(cmd, "cd") == 0) fs_change_dir(strtok(NULL, " \n"));
         else if (strcmp(cmd, "rm") == 0) fs_delete_file(strtok(NULL, " \n"));
         else if (strcmp(cmd, "write") == 0) {
             char *name = strtok(NULL, " \n");
@@ -289,12 +319,11 @@ int main() {
             fs_write_file(name, content);
         }
         else if (strcmp(cmd, "cat") == 0) fs_read_file(strtok(NULL, " \n"));
-        else if (strcmp(cmd, "cd") == 0) fs_change_dir(strtok(NULL, " \n"));
         else if (strcmp(cmd, "help") == 0) print_help();
         else printf("Command not found. Type 'help' for list of commands.\n");
     }
 
-    bitmap_free(fs.bitmap);
+    free(fs.FAT);
     free(fs.disk);
     return 0;
 }
