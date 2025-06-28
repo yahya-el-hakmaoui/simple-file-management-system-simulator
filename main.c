@@ -12,40 +12,88 @@
 #define FAT_FREE -2
 #define FAT_EOF -1
 
+#define FAT_OFFSET 0
+#define FAT_SIZE (sizeof(int) * TOTAL_BLOCKS)
+#define ROOT_OFFSET FAT_SIZE
+#define FILE_META_SIZE sizeof(File)
+#define ROOT_SIZE (MAX_FILES * FILE_META_SIZE)
+#define DATA_OFFSET (FAT_SIZE + ROOT_SIZE)
+
 typedef enum { READ = 1, WRITE = 2, EXECUTE = 4 } Permission;
 
-typedef struct File File;
-typedef struct Directory Directory;
-
-struct File {
+typedef struct File {
     char name[32];
     size_t size;
     time_t created;
     time_t modified;
     int permissions;
     int is_directory;
-    int start_block; // Premier bloc dans FAT
-    Directory *dir;
-    File *parent;
-};
-
-struct Directory {
-    File files[MAX_FILES];
-    size_t file_count;
-};
+    int start_block;
+    int parent_index;
+    int used;
+} File;
 
 typedef struct {
-    Directory root;
-    Directory *current_dir;
-    int *FAT;
     char *disk;
 } FileSystem;
 
 FileSystem fs;
-File *current_dir_file = NULL;
+File *current_dir = NULL;
+int current_parent = -1;
 char username[32] = "user";
 
-// ========================== UTILITAIRES ==========================
+// ------------------------ UTILITAIRES ------------------------
+int *get_fat() {
+    return (int *)(fs.disk + FAT_OFFSET);
+}
+
+File *get_root() {
+    return (File *)(fs.disk + ROOT_OFFSET);
+}
+
+int allocate_block() {
+    int *fat = get_fat();
+    for (int i = 0; i < TOTAL_BLOCKS; i++) {
+        if (fat[i] == FAT_FREE)
+            return i;
+    }
+    return -1;
+}
+
+void free_chain(int block) {
+    int *fat = get_fat();
+    while (block != FAT_EOF && block != FAT_FREE) {
+        int next = fat[block];
+        fat[block] = FAT_FREE;
+        block = next;
+    }
+}
+
+void get_current_path(char *buffer, size_t size) {
+    File *root = get_root();
+    if (current_parent == -1) {
+        snprintf(buffer, size, "/");
+        return;
+    }
+
+    char temp[256] = "";
+    int idx = current_parent;
+    while (idx != -1) {
+        char segment[64];
+        snprintf(segment, sizeof(segment), "/%s", root[idx].name);
+        memmove(temp + strlen(segment), temp, strlen(temp) + 1);
+        memcpy(temp, segment, strlen(segment));
+        idx = root[idx].parent_index;
+    }
+    snprintf(buffer, size, "%s", temp);
+}
+
+void print_prompt() {
+    char path[256];
+    get_current_path(path, sizeof(path));
+    printf("\033[32m%s@fs\033[0m:\033[34m%s\033[0m$ ", username, path);
+}
+
 void print_help() {
     printf("Available commands:\n");
     printf("  help            - Show this help message\n");
@@ -59,146 +107,181 @@ void print_help() {
     printf("  exit            - Exit the filesystem\n");
 }
 
+// ------------------------ INITIALISATION ------------------------
 void fs_init() {
     fs.disk = calloc(1, DISK_SIZE);
-    fs.FAT = malloc(sizeof(int) * TOTAL_BLOCKS);
-    for (int i = 0; i < TOTAL_BLOCKS; i++) fs.FAT[i] = FAT_FREE;
-    fs.root.file_count = 0;
-    fs.current_dir = &fs.root;
-    current_dir_file = NULL;
+    int *fat = get_fat();
+    for (int i = 0; i < TOTAL_BLOCKS; i++) fat[i] = FAT_FREE;
+
+    File *root = get_root();
+    for (int i = 0; i < MAX_FILES; i++) root[i].used = 0;
+
+    current_dir = root;
+    current_parent = -1;
 }
 
-int allocate_block() {
-    for (int i = 0; i < TOTAL_BLOCKS; i++) {
-        if (fs.FAT[i] == FAT_FREE) return i;
-    }
-    return -1;
-}
-
-void free_chain(int block) {
-    while (block != FAT_EOF && block != FAT_FREE) {
-        int next = fs.FAT[block];
-        fs.FAT[block] = FAT_FREE;
-        block = next;
-    }
-}
-
-void get_current_path(char *buffer, size_t size, Directory *dir, const char *current_name) {
-    if (dir == &fs.root || current_dir_file == NULL) {
-        snprintf(buffer, size, "/");
-        return;
-    }
-
-    char temp[256] = "";
-    File *walker = current_dir_file;
-    while (walker) {
-        char segment[64];
-        snprintf(segment, sizeof(segment), "/%s", walker->name);
-        memmove(temp + strlen(segment), temp, strlen(temp) + 1);
-        memcpy(temp, segment, strlen(segment));
-        walker = walker->parent;
-    }
-    snprintf(buffer, size, "%s", temp);
-}
-
-void print_prompt() {
-    char path[256];
-    get_current_path(path, sizeof(path), fs.current_dir, "");
-    printf("\033[32m%s@fs\033[0m:\033[34m%s\033[0m$ ", username, path);
-}
-
-File *fs_find_file(Directory *dir, const char *name) {
-    for (size_t i = 0; i < dir->file_count; i++) {
-        if (strcmp(dir->files[i].name, name) == 0) {
-            return &dir->files[i];
+// ------------------------ FONCTIONS PRINCIPALES ------------------------
+File *fs_find_file(const char *name, int parent) {
+    File *root = get_root();
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (root[i].used && root[i].parent_index == parent && strcmp(root[i].name, name) == 0) {
+            return &root[i];
         }
     }
     return NULL;
 }
 
-// ========================== FONCTIONS FS ==========================
 void fs_create_file(const char *name, int is_dir) {
     if (!name) return;
-    if (fs.current_dir->file_count >= MAX_FILES) {
-        printf("Error: directory full\n");
-        return;
-    }
-    if (fs_find_file(fs.current_dir, name)) {
-        printf("Error: file or directory already exists\n");
-        return;
-    }
+    File *root = get_root();
 
-    File *file = &fs.current_dir->files[fs.current_dir->file_count++];
-    strncpy(file->name, name, sizeof(file->name));
-    file->size = 0;
-    file->created = time(NULL);
-    file->modified = time(NULL);
-    file->permissions = READ | WRITE;
-    file->is_directory = is_dir;
-    file->parent = current_dir_file;
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (!root[i].used) {
+            if (fs_find_file(name, current_parent)) {
+                printf("Error: file or directory already exists\n");
+                return;
+            }
 
-    if (is_dir) {
-        file->dir = malloc(sizeof(Directory));
-        file->dir->file_count = 0;
-        file->start_block = -1;
-    } else {
-        int blk = allocate_block();
-        if (blk == -1) {
-            printf("Error: no free space\n");
-            fs.current_dir->file_count--;
+            File *f = &root[i];
+            memset(f, 0, sizeof(File));
+            strncpy(f->name, name, sizeof(f->name));
+            f->used = 1;
+            f->is_directory = is_dir;
+            f->size = 0;
+            f->permissions = READ | WRITE | EXECUTE;
+            f->created = f->modified = time(NULL);
+            f->parent_index = current_parent;
+
+            if (!is_dir) {
+                int blk = allocate_block();
+                if (blk == -1) {
+                    printf("Error: no space\n");
+                    f->used = 0;
+                    return;
+                }
+                f->start_block = blk;
+                get_fat()[blk] = FAT_EOF;
+            } else {
+                f->start_block = -1;
+            }
             return;
         }
-        fs.FAT[blk] = FAT_EOF;
-        file->start_block = blk;
-        file->dir = NULL;
     }
+    printf("Error: directory full\n");
 }
 
 void fs_delete_file_recursive(File *file) {
+    File *root = get_root();
     if (file->is_directory) {
-        for (size_t i = 0; i < file->dir->file_count; i++) {
-            fs_delete_file_recursive(&file->dir->files[i]);
+        for (int i = 0; i < MAX_FILES; i++) {
+            if (root[i].used && root[i].parent_index == (file - root)) {
+                fs_delete_file_recursive(&root[i]);
+            }
         }
-        free(file->dir);
     } else {
         free_chain(file->start_block);
     }
+    file->used = 0;
 }
 
 void fs_delete_file(const char *name) {
-    for (size_t i = 0; i < fs.current_dir->file_count; i++) {
-        File *file = &fs.current_dir->files[i];
-        if (strcmp(file->name, name) == 0) {
-            if (file->is_directory && file->dir->file_count > 0) {
-                printf("Directory not empty. Delete? (y/n): ");
-                char ans[8]; fgets(ans, sizeof(ans), stdin);
-                if (tolower(ans[0]) != 'y') return;
+    File *target = fs_find_file(name, current_parent);
+    if (!target) {
+        printf("Error: file not found\n");
+        return;
+    }
+
+    if (target->is_directory) {
+        int nonempty = 0;
+        File *root = get_root();
+        for (int i = 0; i < MAX_FILES; i++) {
+            if (root[i].used && root[i].parent_index == (target - root)) {
+                nonempty = 1;
+                break;
             }
-            fs_delete_file_recursive(file);
-            for (size_t j = i; j < fs.current_dir->file_count - 1; j++)
-                fs.current_dir->files[j] = fs.current_dir->files[j + 1];
-            fs.current_dir->file_count--;
-            return;
+        }
+
+        if (nonempty) {
+            printf("Directory not empty. Delete? (y/n): ");
+            char ans[8]; fgets(ans, sizeof(ans), stdin);
+            if (tolower(ans[0]) != 'y') return;
         }
     }
-    printf("Error: file not found\n");
+    fs_delete_file_recursive(target);
+}
+
+int compare_files(const void *a, const void *b) {
+    File *fa = *(File **)a;
+    File *fb = *(File **)b;
+    return strcmp(fa->name, fb->name);
+}
+
+void fs_list() {
+    File *root = get_root();
+    File *files[MAX_FILES];
+    int count = 0;
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        File *f = &root[i];
+        if (f->used && f->parent_index == current_parent) {
+            files[count++] = f;
+        }
+    }
+
+    qsort(files, count, sizeof(File *), compare_files);
+
+    for (int i = 0; i < count; i++) {
+        File *f = files[i];
+        char perm[4] = "---";
+        if (f->permissions & READ) perm[0] = 'r';
+        if (f->permissions & WRITE) perm[1] = 'w';
+        if (f->permissions & EXECUTE) perm[2] = 'x';
+
+        char created[32], modified[32];
+        strftime(created, sizeof(created), "%Y-%m-%d %H:%M:%S", localtime(&f->created));
+        strftime(modified, sizeof(modified), "%Y-%m-%d %H:%M:%S", localtime(&f->modified));
+
+        printf("%c%s\t%lu bytes\tCreated: %s\tModified: %s\t\033[34m%s\033[0m\n",
+               f->is_directory ? 'd' : '-', perm, f->size, created, modified, f->name);
+    }
+}
+
+
+void fs_change_dir(const char *name) {
+    if (!name) return;
+
+    if (strcmp(name, "..") == 0) {
+        if (current_parent != -1) {
+            File *root = get_root();
+            current_parent = root[current_parent].parent_index;
+        }
+        return;
+    }
+
+    File *f = fs_find_file(name, current_parent);
+    if (!f || !f->is_directory) {
+        printf("Error: directory not found\n");
+        return;
+    }
+
+    current_parent = f - get_root();
 }
 
 void fs_write_file(const char *name, const char *content) {
-    File *file = fs_find_file(fs.current_dir, name);
-    if (!file || file->is_directory) {
+    File *f = fs_find_file(name, current_parent);
+    if (!f || f->is_directory) {
         printf("Error: invalid file\n");
         return;
     }
 
-    free_chain(file->start_block);
-    file->start_block = -1;
+    free_chain(f->start_block);
+    f->start_block = -1;
 
     size_t len = strlen(content);
     if (len > MAX_FILE_SIZE) len = MAX_FILE_SIZE;
-    file->size = len;
+    f->size = len;
 
-    int prev_block = -1;
+    int prev = -1;
     size_t written = 0;
 
     while (written < len) {
@@ -207,88 +290,42 @@ void fs_write_file(const char *name, const char *content) {
             printf("Disk full\n");
             return;
         }
+
         size_t chunk = (len - written > BLOCK_SIZE) ? BLOCK_SIZE : (len - written);
-        memcpy(fs.disk + blk * BLOCK_SIZE, content + written, chunk);
+        memcpy(fs.disk + DATA_OFFSET + blk * BLOCK_SIZE, content + written, chunk);
 
-        if (prev_block != -1)
-            fs.FAT[prev_block] = blk;
+        if (prev != -1)
+            get_fat()[prev] = blk;
         else
-            file->start_block = blk;
+            f->start_block = blk;
 
-        fs.FAT[blk] = FAT_EOF;
-        prev_block = blk;
+        get_fat()[blk] = FAT_EOF;
+        prev = blk;
         written += chunk;
     }
 
-    file->modified = time(NULL);
+    f->modified = time(NULL);
 }
 
 void fs_read_file(const char *name) {
-    File *file = fs_find_file(fs.current_dir, name);
-    if (!file || file->is_directory) {
+    File *f = fs_find_file(name, current_parent);
+    if (!f || f->is_directory) {
         printf("Error: invalid file\n");
         return;
     }
 
-    int blk = file->start_block;
-    size_t left = file->size;
-
+    int blk = f->start_block;
+    size_t left = f->size;
     while (blk != FAT_EOF && left > 0) {
         size_t chunk = left > BLOCK_SIZE ? BLOCK_SIZE : left;
-        fwrite(fs.disk + blk * BLOCK_SIZE, 1, chunk, stdout);
+        fwrite(fs.disk + DATA_OFFSET + blk * BLOCK_SIZE, 1, chunk, stdout);
         left -= chunk;
-        blk = fs.FAT[blk];
+        blk = get_fat()[blk];
     }
     printf("\n");
 }
 
-int compare_files(const void *a, const void *b) {
-    const File *fa = (const File *)a;
-    const File *fb = (const File *)b;
-    return strcmp(fa->name, fb->name);
-}
-
-void fs_list() {
-    if (fs.current_dir->file_count == 0) return;
-
-    File sorted[MAX_FILES];
-    memcpy(sorted, fs.current_dir->files, sizeof(File) * fs.current_dir->file_count);
-    qsort(sorted, fs.current_dir->file_count, sizeof(File), compare_files);
-
-    for (size_t i = 0; i < fs.current_dir->file_count; i++) {
-        File *f = &sorted[i];
-        char perm[4] = "---";
-        if (f->permissions & READ) perm[0] = 'r';
-        if (f->permissions & WRITE) perm[1] = 'w';
-        if (f->permissions & EXECUTE) perm[2] = 'x';
-
-        printf("%c%s\t%lu bytes\t%s\n",
-               f->is_directory ? 'd' : '-', perm, f->size, f->name);
-    }
-}
-
-void fs_change_dir(const char *name) {
-    if (!name) return;
-    if (strcmp(name, "..") == 0) {
-        if (current_dir_file && current_dir_file->parent) {
-            fs.current_dir = current_dir_file->parent->dir;
-            current_dir_file = current_dir_file->parent;
-        } else {
-            fs.current_dir = &fs.root;
-            current_dir_file = NULL;
-        }
-        return;
-    }
-    File *f = fs_find_file(fs.current_dir, name);
-    if (!f || !f->is_directory) {
-        printf("Error: directory not found\n");
-        return;
-    }
-    fs.current_dir = f->dir;
-    current_dir_file = f;
-}
-
-// ========================== MAIN LOOP ==========================
+// ------------------------ MAIN ------------------------
 int main() {
     fs_init();
 
@@ -317,13 +354,11 @@ int main() {
             char *content = strtok(NULL, "\n");
             if (!content) content = "";
             fs_write_file(name, content);
-        }
-        else if (strcmp(cmd, "cat") == 0) fs_read_file(strtok(NULL, " \n"));
+        } else if (strcmp(cmd, "cat") == 0) fs_read_file(strtok(NULL, " \n"));
         else if (strcmp(cmd, "help") == 0) print_help();
         else printf("Command not found. Type 'help' for list of commands.\n");
     }
 
-    free(fs.FAT);
     free(fs.disk);
     return 0;
 }
